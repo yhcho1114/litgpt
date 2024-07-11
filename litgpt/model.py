@@ -26,7 +26,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
+                h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
@@ -88,12 +88,17 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         if self.config.scale_embeddings:
-            x = x * (self.config.n_embd**0.5)
+            x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
 
         for block in self.transformer.h:
             x = block(x, cos, sin, mask, input_pos)
         x = self.transformer.ln_f(x)
-        return self.lm_head(x)  # (b, t, vocab_size)
+        x = self.lm_head(x)  # (b, t, vocab_size)
+        if self.config.final_logit_softcapping is not None and self.train:
+            x = x / self.config.final_logit_softcapping
+            x = torch.tanh(x)
+            x = x * self.config.final_logit_softcapping
+        return x
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -137,7 +142,7 @@ class GPT(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, block_idx: int) -> None:
         super().__init__()
         if not config.parallel_residual and config.shared_attention_norm:
             raise NotImplementedError(
@@ -146,9 +151,17 @@ class Block(nn.Module):
             )
 
         self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, block_idx)
         self.norm_2 = None if config.shared_attention_norm else config.norm_class(config.n_embd, eps=config.norm_eps)
         self.mlp = config.mlp_class(config)
+
+        # TODO: check what is faster nn.Identity or lambda x: x
+        self.post_attention_norm = (
+            config.norm_class(config.n_embd, eps=config.norm_eps) if config.post_attention_norm else nn.Identity()
+        )
+        self.post_mlp_norm = (
+            config.norm_class(config.n_embd, eps=config.norm_eps) if config.post_mlp_norm else nn.Identity()
+        )
 
         self.config = config
 
@@ -176,20 +189,25 @@ class Block(nn.Module):
         └───► +
         """
 
+        # TODO: prettify norm layers naming (separate PR maybe)
+        # pre_attention_norm, post_attention_norm, pre_mlp_norm, post_mlp_norm ??
+
         x_normed = self.norm_1(x)
         attention_output = self.attn(x_normed, cos, sin, mask, input_pos)
+        # TODO: maybe a more verbose if-else would be a better choice?
+        attention_output = self.post_attention_norm(attention_output)
 
         if self.config.parallel_residual:
             x_normed = x_normed if self.config.shared_attention_norm else self.norm_2(x)
             x = self.mlp(x_normed) + attention_output + x
         else:
             x = attention_output + x
-            x = self.mlp(self.norm_2(x)) + x
+            x = self.post_mlp_norm(self.mlp(self.norm_2(x))) + x
         return x
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, block_idx: int) -> None:
         super().__init__()
         shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         # key, query, value projections for all heads, but in a batch
@@ -201,6 +219,7 @@ class CausalSelfAttention(nn.Module):
         self.kv_cache: Optional[KVCache] = None
 
         self.config = config
+        self.block_idx = block_idx
 
     def forward(
         self,
@@ -244,7 +263,47 @@ class CausalSelfAttention(nn.Module):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
             k, v = self.kv_cache(input_pos, k, v)
 
-        y = self.scaled_dot_product_attention(q, k, v, mask)
+        # TODO: convert it into a registered buffer?
+        # In Gemma every other layer has a sliding window attention
+        if self.config.sliding_window_size is not None and self.block_idx % 2:
+            # TODO: doesn't look particularly fast (optimized)
+            # TODO: deal with device in a prettier way
+            if mask is None:
+                min_dtype = torch.finfo(q.dtype).min
+                mask = torch.tril(torch.ones(self.config.block_size, self.config.block_size))
+                mask = mask.masked_fill(mask == 0, min_dtype)
+
+            min_dtype = torch.finfo(q.dtype).min
+            sliding_window_mask = torch.tril(
+                torch.ones_like(mask, dtype=torch.bool), diagonal=-self.config.sliding_window_size
+            )
+            mask = torch.where(sliding_window_mask, min_dtype, mask)
+            mask = mask.to(q.device)
+
+        # softcapping is really needed only during training
+        if self.config.attention_logit_softcapping is not None and self.train:
+            # # TODO: mask needs to be created only once
+            if mask is None:
+                min_dtype = torch.finfo(q.dtype).min
+                # mask = torch.tril(torch.ones(self.config.block_size, self.config.block_size))
+                mask = torch.tril(torch.ones(T, T))
+                # mask = mask.masked_fill(mask == 0, min_dtype).to(q.dtype)
+                mask = mask.masked_fill(mask == 0, float("-inf")).to(q.dtype)
+                mask = mask.to(q.device)
+
+            scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
+            scores = q @ k.mT * scale
+            # softcapping start
+            scores = scores / self.config.attention_logit_softcapping
+            scores = torch.tanh(scores)
+            scores = scores * self.config.attention_logit_softcapping
+            # softcapping end
+            scores = scores + mask
+            scores = torch.nn.functional.softmax(scores, dim=-1, dtype=torch.float).to(dtype=q.dtype)
+            y = scores @ v
+            y = y.transpose(1, 2)
+        else:
+            y = self.scaled_dot_product_attention(q, k, v, mask)
 
         y = y.reshape(B, T, self.config.head_size * self.config.n_head)  # re-assemble all head outputs side by side
 
@@ -254,7 +313,7 @@ class CausalSelfAttention(nn.Module):
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        scale = 1.0 / math.sqrt(self.config.head_size)
+        scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
         y = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
         )
@@ -430,12 +489,8 @@ class RMSNorm(torch.nn.Module):
         # NOTE: the original RMSNorm paper implementation is not equivalent
         norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
         x_normed = x * torch.rsqrt(norm_x + self.eps)
-        x_normed = x_normed.to(dtype=dtype)
-        if self.add_unit_offset:
-            # Gemma model requires a unit offset
-            # https://github.com/google/gemma_pytorch/blob/main/gemma/model.py#L176
-            return x_normed * (1 + self.weight)
-        return x_normed * self.weight
+        weight = (1 + self.weight) if self.add_unit_offset else self.weight
+        return (x_normed * weight.float()).to(dtype=dtype)
 
     def reset_parameters(self) -> None:
         torch.nn.init.ones_(self.weight)
